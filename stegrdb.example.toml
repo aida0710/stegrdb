@@ -1,0 +1,28 @@
+node_id = "node-a"
+channel = "example"
+# 中継するLANのインターフェース。DBへ接続するインターフェースとは分ける。
+interface = "eth1"
+promiscuous = true
+
+[relay]
+plugin = "postgres"
+
+[relay.options]
+connection_env = "STEGRDB_POSTGRES_URL"
+max_connections = 4
+replay_window_ms = 4000
+
+[engine]
+queue_capacity = 1024
+batch_size = 128
+flush_interval_ms = 10
+poll_interval_ms = 10
+retry_interval_ms = 100
+operation_timeout_ms = 10000
+shutdown_timeout_ms = 30000
+
+[firewall]
+policy = "whitelist"
+# 空のwhitelistは全拒否。必要なルールを追加する（複数ルールはOR条件）。
+rules = []
+# rules = [{ type = "SrcIpAddress", value = "192.168.50.10" }, { type = "DstIpAddress", value = "192.168.50.10" }]

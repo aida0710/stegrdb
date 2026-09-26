@@ -1,0 +1,21 @@
+[Unit]
+Description=stegrdb relay in the test VM
+Requires=stegrdb-network.service
+After=stegrdb-network.service network-online.target postgresql.service
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+User=stegrdb
+ExecStart=/opt/stegrdb-lab/stegrdb --config /opt/stegrdb-lab/stegrdb.toml
+EnvironmentFile=/opt/stegrdb-lab/postgres.env
+AmbientCapabilities=CAP_NET_RAW
+CapabilityBoundingSet=CAP_NET_RAW
+NoNewPrivileges=yes
+Restart=on-failure
+# DBの起動待ちや占有接続切断後の再接続を、プロセス再起動で行う。
+RestartSec=2
+TimeoutStopSec=40
+
+[Install]
+WantedBy=multi-user.target

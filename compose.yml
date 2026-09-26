@@ -1,25 +1,20 @@
 services:
-  dev-run:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    volumes:
-      - .:/usr/src/app
-      - cargo-cache:/usr/local/cargo/registry
-      - target-cache:/usr/src/app/target
-    privileged: true
-    command: [ "cargo", "run" ]
-
   dev-test:
-    build:
-      context: .
-      dockerfile: Dockerfile
+    build: .
     volumes:
       - .:/usr/src/app
       - cargo-cache:/usr/local/cargo/registry
       - target-cache:/usr/src/app/target
-    privileged: true
-    command: [ "cargo", "test" ]
+    command: ["cargo", "test", "--workspace", "--locked"]
+
+  dev-run:
+    build: .
+    volumes:
+      - .:/usr/src/app
+      - cargo-cache:/usr/local/cargo/registry
+      - target-cache:/usr/src/app/target
+    cap_add: [NET_RAW]
+    command: ["cargo", "run", "--locked", "--", "--config", "stegrdb.toml"]
 
 volumes:
   cargo-cache:

@@ -1,8 +1,95 @@
-# RDB Tunnel Client
+# stegrdb
 
-一度認証情報をcommitしてしまうミスを犯した為、リポジトリを再作成しました。
+Ethernetフレームを、設定で選んだ中継方式を通して別ノードへ送るRust製クライアント。PostgreSQLによる中継と、同一プロセス内のテストに使うメモリ中継を実装している。
 
-## Description
-RDBを経由して通信を行うApplication Tunnel Clientです。
+Linux向け。まず以下の手順でビルドと設定を済ませる。プラグインを追加する場合は[中継プラグインの設計](docs/relay-plugins.md)、変更点と検証範囲は[監査・検証記録](docs/review-2026-09-26.md)を参照する。
 
-※ debian/ubuntuのみ動作保証
+## ビルドする
+
+Ubuntu/Debianで必要なツールを入れる。Rustの導入方法は[rustup公式](https://rust-lang.github.io/rustup/installation/other.html)に従う。
+
+```bash
+sudo apt-get update
+sudo apt-get install -y build-essential curl ca-certificates libcap2-bin postgresql-client python3
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+. "$HOME/.cargo/env"
+rustup component add rustfmt clippy
+cargo build --release --locked
+```
+
+`./setup.sh`でも設定ファイルの作成とreleaseビルドを行える。既存の設定ファイルを上書きしない。
+
+## 中継先と対象ネットワークを設定する
+
+`stegrdb.example.toml`を`stegrdb.toml`へコピーする。各ノードで`node_id`を変え、中継相手とは同じ`channel`を指定する。`interface`には中継対象LANのインターフェースを指定する。DBへ接続するインターフェースは分ける。
+
+フィルタは規定で全拒否。必要な通信だけを`[firewall].rules`へ追加する。各ルールはOR条件で、送信側と受信側の両方で適用される。ARPを中継するには、IPのルールとは別に`EtherType`の2054を許可する。
+
+```toml
+[firewall]
+policy = "whitelist"
+rules = [
+  { type = "SrcIpAddress", value = "192.168.50.10" },
+  { type = "DstIpAddress", value = "192.168.50.10" },
+  { type = "EtherType", value = 2054 },
+]
+```
+
+PostgreSQLの接続情報は`STEGRDB_POSTGRES_URL`に設定する。接続文字列はlibpq形式またはPostgreSQL URIを使える。次の入力はターミナルへ表示されない。入力例の形式は`host=db.example.com user=stegrdb password=... dbname=stegrdb sslmode=require`。実際の接続先と認証情報へ置き換える。
+
+```bash
+read -r -s -p 'PostgreSQL接続文字列: ' STEGRDB_POSTGRES_URL
+printf '\n'
+export STEGRDB_POSTGRES_URL
+psql "$STEGRDB_POSTGRES_URL" --set ON_ERROR_STOP=1 -f plugins/postgres/schema.sql
+```
+
+初期化SQLはスキーマを作成できる権限で実行する。既存のパケットログ用テーブルは変更しない。実行時は専用スキーマへの必要な読み書き権限を持つユーザを使う。接続文字列は`.env`に保存してもよい。保存する場合は`chmod 600 .env`を適用する。
+
+TLSでサーバ証明書とホスト名を確認する。プライベートCAを使う場合はOSの信頼ストアへ登録する。暗号化しない接続を使う隔離試験では、`sslmode=disable`を明示する。
+
+## 設定を確認して起動する
+
+```bash
+./target/release/stegrdb --list-plugins
+./target/release/stegrdb --config stegrdb.toml --check-config
+sudo setcap cap_net_raw=ep ./target/release/stegrdb
+./target/release/stegrdb --config stegrdb.toml
+```
+
+`--check-config`は共通設定の構文・値を検証する。DBへの接続、プラグイン固有設定、インターフェースの存在は実行時に確認する。再ビルド後は実行ファイルのcapabilityを再設定する。
+
+Ctrl+CまたはSIGTERMで収集を止め、保存待ちのフレームを送ってから終了する。停止期限を超えるとエラーと未保存件数を出す。ログは標準エラーへ出力し、`RUST_LOG`でレベルを変えられる。
+
+## テストする
+
+```bash
+cargo fmt --all --check
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo test --workspace --locked
+cargo test -p stegrdb --no-default-features --locked
+cargo bench --bench packet_pipeline --locked
+```
+
+外部サービスを使うテストは通常の`cargo test`ではスキップする。Dockerが未導入のUbuntu/Debianでは次のように準備できる。Dockerを実行できる権限のあるターミナルからテストを実行する。
+
+```bash
+sudo apt-get install -y docker.io
+sudo systemctl enable --now docker
+bash scripts/test-postgres.sh
+bash scripts/test-network.sh
+```
+
+PostgreSQL試験は一時コンテナを作り、終了時に削除する。ネットワーク試験は外部接続のないコンテナ内に3組のvethを作る。ホストのインターフェースを変更しない。Dockerのテスト用イメージはキャッシュとして残る。
+
+VMで起動から通信まで確認する場合は[3台のVMによるテスト環境](docs/vm-lab.md)を使う。`scripts/vm-lab up`で環境を作り、`scripts/vm-lab test`でICMP・TCP・UDPとノード停止後の再配送を検証する。
+
+## 旧版から移行する
+
+設定は`.env`とDBの制御テーブルからTOMLへ移した。旧`NODE_ID`は`node_id`、`DOCKER_INTERFACE_NAME`は`interface`として指定する。旧`TIMESCALE_DB_*`は一つの接続文字列へまとめる。対話式のインターフェース選択はなく、設定で指定する。
+
+`node_list`と`node_activity`は新しい実行経路では使わない。`firewall_settings`のルールはTOMLへ移す。同じpolicyのルールは従来どおりOR条件で、優先度0も有効な通常ルールとして扱う。IPやポートを持たないパケットに、架空の0番ポートを割り当てない。
+
+旧`packets`と`processed_packets`からの自動移行は行わない。新しい`stegrdb_relay`スキーマを作り、相手ノードも同じ版へそろえる。保存された時刻間隔を再現する待機もなくし、取得できたフレームから順に送る。旧IDPS専用ログ設定は使わず、標準エラーのログと終了時の集計を見る。
+
+PostgreSQLを含めずにビルドする場合は`cargo build --release --no-default-features`を使う。このビルドでも、追加した非DBプラグインを同じ共通APIから利用できる。

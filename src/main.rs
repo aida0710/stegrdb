@@ -1,82 +1,88 @@
-mod config;
-mod database;
-mod error;
-mod interface;
-mod logger;
-mod packet;
-mod services;
-mod tasks;
-mod utils;
-
-use crate::config::AppConfig;
-use crate::database::Database;
-use crate::error::InitProcessError;
-use crate::interface::select_interface;
-use crate::logger::setup_logger::setup_logger;
-use crate::services::{DbService, FirewallService};
-use crate::tasks::TaskScheduler;
-use log::{error, info};
+use log::info;
+use std::{
+    path::PathBuf,
+    sync::{atomic::Ordering, Arc},
+};
+use stegrdb::{
+    config::AppConfig,
+    engine::{Engine, EngineSettings},
+    network::LinuxSocket,
+    plugins::builtin_plugins,
+};
+use tokio_util::sync::CancellationToken;
 
 #[tokio::main]
-async fn main() -> Result<(), InitProcessError> {
-    // 設定の読み込み
-    let config: AppConfig = AppConfig::new().map_err(|e| InitProcessError::ConfigurationError(e.to_string()))?;
-
-    // ロガーのセットアップ
-    setup_logger(config.logger_config).map_err(|e| InitProcessError::LoggerError(e.to_string()))?;
-
-    info!("loggerが正常にセットアップされました");
-    idps_log!("idps logの表示が有効になっています");
-
-    info!("Node IDは{}に指定されています", config.node_id);
-
-    // データベース接続
-    Database::connect(
-        &config.database.host,
-        config.database.port,
-        &config.database.user,
-        &config.database.password,
-        &config.database.database,
-    )
-    .await
-    .map_err(|e| InitProcessError::DatabaseConnectionError(e.to_string()))?;
-
-    info!("データベースに接続できました: address:{}, port:{}", config.database.host, config.database.port);
-
-    let interface = select_interface(config.network.docker_mode, &config.network.docker_interface_name).map_err(|e| InitProcessError::InterfaceSelectionError(e.to_string()))?;
-
-    let mac_str = match &interface.mac {
-        Some(mac) => mac.to_string(),
-        None => "不明".to_string(),
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    let arguments: Vec<_> = std::env::args().skip(1).collect();
+    let registry = builtin_plugins()?;
+    if arguments == ["--list-plugins"] {
+        println!("{}", registry.names().join("\n"));
+        return Ok(());
+    }
+    if arguments == ["--help"] || arguments == ["-h"] {
+        println!("stegrdb [--config PATH] [--check-config]\nstegrdb --list-plugins");
+        return Ok(());
+    }
+    let mut path = PathBuf::from("stegrdb.toml");
+    let mut check_only = false;
+    let mut arguments = arguments.iter();
+    while let Some(argument) = arguments.next() {
+        match argument.as_str() {
+            "--config" => path = arguments.next().ok_or("--configにパスを指定してください")?.into(),
+            "--check-config" => check_only = true,
+            _ => return Err(format!("不明な引数: {argument}").into()),
+        }
+    }
+    let config = AppConfig::load(&path)?;
+    if !registry.names().contains(&config.relay.plugin.as_str()) {
+        return Err(format!("未登録のプラグイン: {}", config.relay.plugin).into());
+    }
+    if check_only {
+        println!("設定ファイルの構文と共通設定は正常です（接続・デバイス・プラグイン固有設定は未検証）");
+        return Ok(());
+    }
+    match dotenv::dotenv() {
+        Ok(_) => {},
+        Err(dotenv::Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {},
+        Err(_) => return Err(".envを読み込めません（認証情報保護のため内容は表示しません）".into()),
+    }
+    let network = Arc::new(LinuxSocket::open(&config.interface, config.promiscuous)?);
+    let relay = registry.connect(&config.relay.plugin, config.context(), config.relay.options).await?;
+    let engine = Arc::new(Engine::new(
+        relay,
+        network,
+        EngineSettings {
+            firewall: config.firewall,
+            config: config.engine,
+        },
+    )?);
+    info!("中継を開始します: node={}, channel={}, plugin={}", config.node_id, config.channel, config.relay.plugin);
+    let shutdown = CancellationToken::new();
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    let signals = async {
+        tokio::select! { outcome = tokio::signal::ctrl_c() => outcome, _ = terminate.recv() => Ok(()) }
     };
-
-    let ip_addresses: Vec<String> = interface.ips.iter().map(|ip| ip.to_string()).collect();
-    let ip_str = if ip_addresses.is_empty() { "不明".to_string() } else { ip_addresses.join(", ") };
-
-    info!("デバイスの選択に成功しました: {}", interface.name);
-    info!("選択されたインターフェース情報: 名前={}, MACアドレス={}, IPアドレス={}", interface.name, mac_str, ip_str);
-
-    match DbService::validate_and_record_node(config.node_id, &interface).await {
-        Ok(node_name) => {
-            info!("ノード {} ({}) の検証と起動記録が完了しました", config.node_id, node_name);
+    let running = engine.clone().run(shutdown.clone());
+    tokio::pin!(running);
+    let outcome = tokio::select! {
+        outcome = &mut running => outcome,
+        signal = signals => {
+            shutdown.cancel();
+            let outcome = running.await;
+            signal?;
+            outcome
         },
-        Err(e) => {
-            error!("ノード検証エラー: {}", e);
-            return Err(InitProcessError::ConfigurationError(format!("ノード検証エラー: {}", e)));
-        },
-    }
-
-    if let Err(e) = FirewallService::initialize(config.node_id).await {
-        error!("ファイアウォール初期化エラー: {}", e);
-        return Err(InitProcessError::ConfigurationError(format!("ファイアウォール初期化エラー: {}", e)));
-    }
-
-    let scheduler = TaskScheduler::new(interface);
-    if let Err(e) = scheduler.run().await.map_err(|e| InitProcessError::TaskExecutionProcessError(e.to_string())) {
-        error!("タスクの実行処理に失敗しました: {:?}", e);
-        std::process::exit(1);
-    }
-
-    info!("アプリケーションを正常終了します");
+    };
+    info!(
+        "中継終了: capture={}, publish={}, inject={}, filter={}, reject={}, retry={}",
+        engine.metrics.captured.load(Ordering::Relaxed),
+        engine.metrics.published.load(Ordering::Relaxed),
+        engine.metrics.injected.load(Ordering::Relaxed),
+        engine.metrics.filtered.load(Ordering::Relaxed),
+        engine.metrics.rejected_deliveries.load(Ordering::Relaxed),
+        engine.metrics.retries.load(Ordering::Relaxed)
+    );
+    outcome?;
     Ok(())
 }

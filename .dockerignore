@@ -1,0 +1,8 @@
+target
+.git
+.env*
+stegrdb.toml
+artifacts
+*.log
+.vm-lab
+__pycache__

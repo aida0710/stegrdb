@@ -1,26 +1,7 @@
-# rdb-tunnel todo list
-### rdb-tunnel
+# ソース構成
 
-- [x] パケットのipヘッダー解析
-- [ ] データベースに全てのパケットを保存
-  - [ ] src_ip
-  - [ ] dst_ip
-  - [ ] src_port
-  - [ ] dst_port
-  - [ ] protocol
-    - [ ] IPv4: 4
-      - [ ] TCP: 6
-      - [ ] UDP: 17
-    - [ ] IPv6: 41
-      - [ ] TCP: 6
-      - [ ] UDP: 17
-    - [ ] ICMP
-      - [ ] IPv4用: 1
-      - [ ] IPv6用 (ICMPv6): 58
-  - [ ] timestamp
-  - [ ] data
-  - [ ] raw_packet
-- [ ] データベースからパケットを取得 (pooling) //変更通知(NOTIFY)を使う案もあるが、複雑さが増すため、要検討。
-- [ ] データベースに保存されたfirewallのルールを取得
-- [ ] ルールに従ってパケットをフィルタリング
-- [ ] 取得したパケットを再注入
+パケットの解析は`packet/`、送受信の進行と停止は`engine/`、Linuxのraw socketは`network/`が担当する。
+
+中継の共通APIは`../crates/relay/`、具体的な実装は`../plugins/`にある。新しい中継方式を登録する場所は`plugins.rs`。
+
+設定と実行方法は[README](../readme.md)、プラグインの契約は[中継プラグインの設計](../docs/relay-plugins.md)を参照する。
