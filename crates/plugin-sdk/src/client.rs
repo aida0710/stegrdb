@@ -31,7 +31,8 @@ impl Drop for ProcessRelay {
 }
 
 impl ProcessRelay {
-    pub async fn connect(executable: &Path, manifest: &PluginManifest, context: RelayContext, options: Value) -> Result<Self, RelayError> {
+    pub async fn connect(executable: &Path, manifest: &PluginManifest, configuration: (RelayContext, Value)) -> Result<Self, RelayError> {
+        let (context, options) = configuration;
         manifest.validate_options(&options)?;
         let mut command = Command::new(executable);
         command.arg("--stdio").stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::inherit()).kill_on_drop(true);
