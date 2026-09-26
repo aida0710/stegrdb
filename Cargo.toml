@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/relay", "plugins/memory", "plugins/postgres"]
+members = ["crates/relay", "crates/plugin-sdk", "plugins/memory", "plugins/postgres"]
 resolver = "2"
 
 [package]

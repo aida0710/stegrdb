@@ -11,7 +11,7 @@ use async_trait::async_trait;
 use serde_json::Value;
 use std::sync::Arc;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct RelayContext {
     pub node_id: String,
     pub channel: String,
