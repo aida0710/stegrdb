@@ -4,6 +4,8 @@ import shlex
 import subprocess
 import tarfile
 
+from configuration import relay_configuration
+
 from settings import DEPLOY_TIMEOUT_SECONDS, REMOTE_TIMEOUT_SECONDS, ROOT, SSH_PORTS, SSH_TIMEOUT_SECONDS, STATE
 
 
@@ -25,7 +27,7 @@ def run(node, command, *, input_text=None, check=True, timeout=REMOTE_TIMEOUT_SE
     )
 
 
-def deploy(node, password):
+def deploy(node, password, relay):
     from settings import DATABASE_PORT
 
     directory = STATE / node
@@ -39,6 +41,8 @@ def deploy(node, password):
         f'STEGRDB_LAB_PASSWORD={password}\n'
     )
     environment.chmod(0o600)
+    configuration = directory / "stegrdb.toml"
+    configuration.write_text(relay_configuration(node, relay))
     archive = directory / "deploy.tar"
     with tarfile.open(archive, "w") as bundle:
         for filename in ("configure.sh", "network.sh", "probe.py", "stegrdb.service", "stegrdb-network.service"):
@@ -46,6 +50,13 @@ def deploy(node, password):
         bundle.add(ROOT / "target/release/stegrdb", arcname="stegrdb")
         bundle.add(ROOT / "plugins/postgres/schema.sql", arcname="schema.sql")
         bundle.add(environment, arcname="postgres.env")
+        bundle.add(configuration, arcname="stegrdb.toml")
+        for plugin in ("postgres", "p2p"):
+            for filename in ("plugin.json", f"stegrdb-plugin-{plugin}"):
+                bundle.add(STATE / "packages" / plugin / filename, arcname=f"packages/{plugin}/{filename}")
+        bundle.add(STATE / "identities" / node / "key.der", arcname="identity/key.der")
+        for peer in ("a", "b", "c"):
+            bundle.add(STATE / "identities" / peer / "cert.der", arcname=f"identity/{peer}.der")
     archive.chmod(0o600)
     try:
         with archive.open("rb") as stream:
@@ -53,7 +64,7 @@ def deploy(node, password):
                 ssh_arguments(node) + ["sudo mkdir -p /opt/stegrdb-lab && sudo tar -x -C /opt/stegrdb-lab"],
                 stdin=stream, check=True, timeout=REMOTE_TIMEOUT_SECONDS,
             )
-        completed = run(node, f"sudo bash /opt/stegrdb-lab/configure.sh {shlex.quote(node)}", timeout=DEPLOY_TIMEOUT_SECONDS)
+        completed = run(node, f"sudo bash /opt/stegrdb-lab/configure.sh {shlex.quote(node)} {shlex.quote(relay)}", timeout=DEPLOY_TIMEOUT_SECONDS)
         print(completed.stdout, end="", flush=True)
     finally:
         archive.unlink(missing_ok=True)

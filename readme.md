@@ -1,6 +1,6 @@
 # stegrdb
 
-Ethernetフレームを、設定で選んだ中継方式を通して別ノードへ送るRust製クライアント。PostgreSQLによる中継と、同一プロセス内のテストに使うメモリ中継を実装している。
+Ethernetフレームを、設定で選んだ中継方式を通して別ノードへ送るRust製クライアント。PostgreSQL・P2Pは外部プロセス型プラグインとして追加する。本体の再ビルドは不要。メモリ中継は同一プロセス内のテスト用として組み込んでいる。
 
 Linux向け。まず以下の手順でビルドと設定を済ませる。プラグインを追加する場合は[中継プラグインの設計](docs/relay-plugins.md)、変更点と検証範囲は[監査・検証記録](docs/review-2026-09-26.md)を参照する。
 
@@ -14,10 +14,46 @@ sudo apt-get install -y build-essential curl ca-certificates libcap2-bin postgre
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
 . "$HOME/.cargo/env"
 rustup component add rustfmt clippy
-cargo build --release --locked
+cargo build --release --bin stegrdb --locked
 ```
 
 `./setup.sh`でも設定ファイルの作成とreleaseビルドを行える。既存の設定ファイルを上書きしない。
+
+## プラグインを追加する
+
+PostgreSQLとP2Pは所有者のprivateリポジトリで開発し、本体からsubmoduleとして参照する。本体だけのビルド・試験にはsubmoduleの取得は不要。開発・VM試験で使う場合は、GitHubの権限があるアカウントで取得する。
+
+```bash
+git submodule update --init --recursive
+```
+
+利用時はGitとRustを使わず、GitHub Releaseのビルド済み配布物を追加できる。privateリポジトリのContents読み取り権限を持つトークンを入力する。
+
+```bash
+read -r -s -p 'GitHubトークン: ' STEGRDB_GITHUB_TOKEN
+printf '\n'
+export STEGRDB_GITHUB_TOKEN
+./target/release/stegrdb plugin add postgres
+./target/release/stegrdb plugin add p2p
+./target/release/stegrdb plugin list
+./target/release/stegrdb plugin describe postgres
+./target/release/stegrdb plugin configure postgres --set max_connections=4
+./target/release/stegrdb plugin validate postgres
+```
+
+`configure postgres`だけなら対話設定になる。環境変数名には`STEGRDB_POSTGRES_URL`、接続数には`4`、初回再生期間には`4000`を入力するか、空欄で既定値を使う。秘密情報の値は入力せず、参照する環境変数名を指定する。
+
+保存先は`$XDG_DATA_HOME/stegrdb/plugins`、未設定なら`~/.local/share/stegrdb/plugins`。サービス用には`STEGRDB_PLUGIN_DIR`で共通の場所を指定する。CLIの`--directory`はその操作に限った指定なので、サービス起動にも同じ場所を設定する。プラグインの設定は`.config/<名前>.json`へ権限0600で保存し、`[relay.options]`の項目で上書きできる。
+
+```bash
+./target/release/stegrdb plugin update p2p
+./target/release/stegrdb plugin remove p2p
+./target/release/stegrdb plugin add --path ./dist/postgres
+```
+
+設定の保存・更新・削除は対象の中継を停止してから行う。使用中の操作は拒否する。削除後も設定は保持する。更新は実行ファイルのSHA256、通信仕様、OS・CPU、保存済み設定を検証し、原子的に入れ替える。SHA256は破損検出であり、第三者署名ではない。取得先リポジトリと認証済みHTTPSを信頼境界とする。
+
+P2Pの鍵作成・接続設定・任意のNext.js接続情報交換サーバは[stegrdb-plugin-p2p](https://github.com/aida0710/stegrdb-plugin-p2p)のREADMEを参照する。
 
 ## 中継先と対象ネットワークを設定する
 
@@ -41,7 +77,8 @@ PostgreSQLの接続情報は`STEGRDB_POSTGRES_URL`に設定する。接続文字
 read -r -s -p 'PostgreSQL接続文字列: ' STEGRDB_POSTGRES_URL
 printf '\n'
 export STEGRDB_POSTGRES_URL
-psql "$STEGRDB_POSTGRES_URL" --set ON_ERROR_STOP=1 -f plugins/postgres/schema.sql
+~/.local/share/stegrdb/plugins/postgres/stegrdb-plugin-postgres --schema > schema.sql
+psql "$STEGRDB_POSTGRES_URL" --set ON_ERROR_STOP=1 -f schema.sql
 ```
 
 初期化SQLはスキーマを作成できる権限で実行する。既存のパケットログ用テーブルは変更しない。実行時は専用スキーマへの必要な読み書き権限を持つユーザを使う。接続文字列は`.env`に保存してもよい。保存する場合は`chmod 600 .env`を適用する。
@@ -57,7 +94,7 @@ sudo setcap cap_net_raw=ep ./target/release/stegrdb
 ./target/release/stegrdb --config stegrdb.toml
 ```
 
-`--check-config`は共通設定の構文・値を検証する。DBへの接続、プラグイン固有設定、インターフェースの存在は実行時に確認する。再ビルド後は実行ファイルのcapabilityを再設定する。
+`--check-config`は共通設定と外部プラグインの設定スキーマを検証する。DBへの接続やインターフェースの存在は実行時に確認する。再ビルド後は実行ファイルのcapabilityを再設定する。
 
 Ctrl+CまたはSIGTERMで収集を止め、保存待ちのフレームを送ってから終了する。停止期限を超えるとエラーと未保存件数を出す。ログは標準エラーへ出力し、`RUST_LOG`でレベルを変えられる。
 
@@ -92,4 +129,4 @@ VMで起動から通信まで確認する場合は[3台のVMによるテスト�
 
 旧`packets`と`processed_packets`からの自動移行は行わない。新しい`stegrdb_relay`スキーマを作り、相手ノードも同じ版へそろえる。保存された時刻間隔を再現する待機もなくし、取得できたフレームから順に送る。旧IDPS専用ログ設定は使わず、標準エラーのログと終了時の集計を見る。
 
-PostgreSQLを含めずにビルドする場合は`cargo build --release --no-default-features`を使う。このビルドでも、追加した非DBプラグインを同じ共通APIから利用できる。
+0.2の組み込みPostgreSQLから移行する場合は、`plugin add postgres`でプラグインを追加する。接続設定とDBスキーマはそのまま使える。0.3の本体は常にPostgreSQLへ依存せずにビルドされる。

@@ -19,7 +19,6 @@ jobs:
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo test --workspace --locked
       - run: cargo test -p stegrdb --no-default-features --locked
-      - run: bash scripts/test-postgres.sh
       - run: bash scripts/test-network.sh
       - run: python3 -m py_compile tests/vm/*.py tests/vm/guest/probe.py
       - run: bash -n scripts/vm-lab tests/vm/guest/*.sh

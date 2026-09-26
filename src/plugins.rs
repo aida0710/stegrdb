@@ -4,7 +4,5 @@ use stegrdb_relay::{PluginRegistry, RelayError};
 pub fn builtin_plugins() -> Result<PluginRegistry, RelayError> {
     let mut registry = PluginRegistry::default();
     registry.register(stegrdb_relay_memory::MemoryPlugin::default())?;
-    #[cfg(feature = "postgres")]
-    registry.register(stegrdb_relay_postgres::PostgresPlugin)?;
     Ok(registry)
 }

@@ -1,6 +1,7 @@
-"""3台のゲスト間で、DBを経由した実通信と停止中の配送待ちを確認する。"""
+"""3台のゲスト間で、中継方式ごとの実通信と停止後の再配送を確認する。"""
 
 from datetime import datetime
+import hashlib
 import json
 import time
 import uuid
@@ -30,7 +31,7 @@ def database_count(sql):
     return int(completed.stdout.strip())
 
 
-def prepare_receivers():
+def prepare_receivers(relay):
     for node in NODES:
         if not qemu.is_running(node):
             raise RuntimeError("先にscripts/vm-lab upを実行してください")
@@ -42,8 +43,9 @@ def prepare_receivers():
                         "/usr/bin/python3 /opt/stegrdb-lab/probe.py serve")
         wait_for(lambda: remote.run(node, "test -f /run/stegrdb-probe.ready", check=False).returncode == 0,
                  f"VM {node}の受信サーバが起動していません")
-    wait_for(lambda: database_count("SELECT count(*) FROM stegrdb_relay.nodes WHERE channel='vm-lab'") == 3,
-             "3ノードの登録が揃いません")
+    if relay == "postgres":
+        wait_for(lambda: database_count("SELECT count(*) FROM stegrdb_relay.nodes WHERE channel='vm-lab'") == 3,
+                 "3ノードの登録が揃いません")
 
 
 def check_connectivity():
@@ -60,7 +62,7 @@ def check_connectivity():
     return reports
 
 
-def check_offline_delivery():
+def check_offline_delivery(relay):
     token = uuid.uuid4().hex
     # 停止試験中のARP再解決に結果を左右させず、UDPの未処理キューを直接検証する。
     remote.run("a", "sudo ip netns exec client ip neigh replace 192.0.2.13 "
@@ -68,30 +70,59 @@ def check_offline_delivery():
     remote.run("c", "sudo systemctl stop stegrdb")
     try:
         expected = json.loads(remote.run("a", f"{PROBE} send-udp 192.0.2.13 {token}").stdout)
-        wait_for(lambda: database_count("SELECT count(*) FROM stegrdb_relay.pending "
-                                        "WHERE channel='vm-lab' AND node_id='vm-c'") >= len(expected),
-                 "停止ノード向けのフレームがDBに揃いません")
+        if relay == "postgres":
+            wait_for(lambda: database_count("SELECT count(*) FROM stegrdb_relay.pending "
+                                            "WHERE channel='vm-lab' AND node_id='vm-c'") >= len(expected),
+                     "停止ノード向けのフレームがDBに揃いません")
         before = json.loads(remote.run("c", f"{PROBE} received {token}").stdout)
         assert not before, "中継停止中に別経路で届いています"
     finally:
         remote.run("c", "sudo systemctl start stegrdb")
     wait_for(lambda: json.loads(remote.run("c", f"{PROBE} received {token}").stdout) == expected,
              "再起動後のUDPペイロードが送信内容と一致しません")
-    wait_for(lambda: database_count("SELECT count(*) FROM stegrdb_relay.pending "
-                                    "WHERE channel='vm-lab' AND node_id='vm-c'") == 0,
-             "配送後にACKされていないフレームがあります")
+    if relay == "postgres":
+        wait_for(lambda: database_count("SELECT count(*) FROM stegrdb_relay.pending "
+                                        "WHERE channel='vm-lab' AND node_id='vm-c'") == 0,
+                 "配送後にACKされていないフレームがあります")
     return {"recovered_udp_packets": len(expected), "payload_sha256_verified": True}
 
 
-def run_tests():
+def check_plugin_management(relay):
+    command = "sudo -u stegrdb /opt/stegrdb-lab/stegrdb plugin --directory /opt/stegrdb-lab/plugins"
+    before = remote.run("a", "sha256sum /opt/stegrdb-lab/stegrdb").stdout.split()[0]
+    assert remote.run("a", f"{command} remove {relay}", check=False).returncode != 0
+    assert remote.run("a", f"{command} update {relay} --path /opt/stegrdb-lab/packages/{relay}", check=False).returncode != 0
+    inactive = "postgres" if relay == "p2p" else "p2p"
+    remote.run("a", f"{command} remove {inactive}")
+    remote.run("a", f"{command} add --path /opt/stegrdb-lab/packages/{inactive}")
+    if inactive == "postgres":
+        remote.run("a", f"{command} configure postgres --set max_connections=4")
+        remote.run("a", f"{command} validate postgres")
+        assert remote.run("a", f"{command} configure postgres --set max_connections=0", check=False).returncode != 0
+    after = remote.run("a", "sha256sum /opt/stegrdb-lab/stegrdb").stdout.split()[0]
+    assert before == after, "プラグインの追加削除で本体が変更されています"
+    with (ROOT / "target/release/stegrdb").open("rb") as stream:
+        expected = hashlib.file_digest(stream, "sha256").hexdigest()
+    for node in NODES:
+        assert remote.run(node, "sha256sum /opt/stegrdb-lab/stegrdb").stdout.split()[0] == expected
+        assert remote.run(node, "command -v cargo", check=False).returncode != 0
+    return {"active_remove_rejected": True, "active_update_rejected": True,
+            "inactive_remove_and_add": True, "core_sha256_unchanged": before, "cargo_absent_on_guests": True}
+
+
+def run_tests(relay):
     timestamp = datetime.now().astimezone()
     destination = ROOT / "artifacts/vm" / timestamp.strftime("%Y-%m-%d/%H%M%S")
     destination.mkdir(parents=True)
-    report = {"started_at": timestamp.isoformat(), "status": "failed"}
+    report = {"started_at": timestamp.isoformat(), "status": "failed", "relay": relay}
     try:
-        prepare_receivers()
+        if relay == "p2p":
+            remote.run("a", "sudo systemctl stop postgresql")
+            report["postgres_stopped"] = True
+        prepare_receivers(relay)
         report["connectivity"] = check_connectivity()
-        report["offline_delivery"] = check_offline_delivery()
+        report["offline_delivery"] = check_offline_delivery(relay)
+        report["plugin_management"] = check_plugin_management(relay)
         report["status"] = "passed"
         print("3台のVM: ICMP・TCP・UDP・停止後の再配送が成功しました", flush=True)
     finally:

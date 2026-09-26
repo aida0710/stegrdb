@@ -2,43 +2,55 @@
 
 stegrdbはEthernetフレームを中継する。DBへの保存方法、メッセージキューの使い方、別プロセスとの通信方式は、中継プラグインが決める。パケットの解析・フィルタ・NICへの送受信はコアが担当する。
 
-この版ではRustクレートを追加して再ビルドする。共有ライブラリを実行中に読み込む機能は持たない。
+本体は`crates/relay`のpublish・receive・acknowledgeだけを使う。外部プラグインは独立した実行ファイルで、インストール後に本体を再ビルドする必要はない。
 
 ```mermaid
 flowchart LR
-    NIC["ネットワークインターフェース"] <--> Engine["解析・フィルタ・送受信"]
-    Engine <--> API["Relay共通API"]
-    API <--> PostgreSQL["PostgreSQLプラグイン"]
-    API <--> Memory["メモリプラグイン"]
-    API <--> Future["追加する中継方式"]
+    NIC[LAN] <--> Engine[解析・フィルタ・送受信]
+    Engine <--> IPC[バージョン付きローカル通信]
+    IPC <--> PG[PostgreSQLプラグイン]
+    IPC <--> P2P[P2Pプラグイン]
+    P2P <--> Peer[相手のP2Pプラグイン]
 ```
 
-## 共通APIにはフレームと受領情報だけを渡す
+## 配布・設定・通信を分ける
 
-`crates/relay`はSQL、PostgreSQLの型、raw socket、フィルタルールを知らない。
+開発用の`plugins/postgres`と`plugins/p2p`はprivateリポジトリのsubmodule。実行時はGitHub Releaseかローカル配布物からインストールし、開発用のsubmoduleは参照しない。親リポジトリはGitのコミットを固定し、各プラグインは共通SDKのGit revisionとCargo.lockを固定する。
+
+配布物の`plugin.json`に名前、バージョン、OS・CPU、実行ファイル名、SHA256、通信仕様、JSON Schemaを持たせる。本体はプラグインごとの設定項目をハードコードしない。設定の型・必須条件・説明・既定値はプラグイン側が定義する。CLIの設定は次回起動時に反映し、実行中の無停止切替は行わない。
+
+通信仕様v1はstdin/stdoutの長さ付きMessagePack。stdoutをログへ使わずstderrへ出す。`describe`でインストール済み定義と実行ファイルを照合してから、`connect`へnode_id・channel・設定を渡す。詳細は[SDKの通信仕様](../crates/plugin-sdk/README.md)。Rustの共有ライブラリABIには依存しない。
 
 | API | 責務 |
 | --- | --- |
-| `RelayPlugin::connect` | プラグイン固有の設定を検証し、指定channel/node_idの中継を作る |
-| `Relay::publish` | フレームのバッチを受け付ける。同じIDの再試行で重複を作らない |
-| `Relay::receive` | 未処理のフレームを上限件数まで取得する。取得だけでは処理済みにしない |
-| `Relay::acknowledge` | 完了した受領情報を記録する。同じ受領情報の再試行を許容する |
+| publish | フレームをバッチで受け付ける。同じIDの再試行を扱う |
+| receive | ACKされていないフレームを非破壊で取得する |
+| acknowledge | NICへの送信またはフィルタ拒否が完了した受領情報を記録する |
 
-`Frame`はUUIDと元のEthernetフレームを持つ。UUIDは収集時に一度だけ生成し、再試行でも変えない。同じUUIDを別の内容に使い回してはいけない。`Receipt`はプラグインが発行する受領情報で、コアは値を解釈せずに返す。
+UUIDは収集時に一度生成し、再試行でも維持する。`Receipt`はプラグインが発行する不透明な文字列。本体は中身を解釈しない。同じUUIDを異なる内容へ使い回してはいけない。
 
-`channel`が同じノード同士で中継し、送信元自身には返さない。各ノードは同じchannel内で一意の`node_id`を持つ。プラグインは同じIDの多重接続を拒否する。
+1回128件、メッセージ16MiBで制限し、本体は大きいバッチを分割する。専用タスクが要求と応答を対応付けるため、呼び出しキャンセル時に次の要求へ前の応答が混ざらない。IPCが30秒で完了しない、または子プロセスが終了した場合は本体へ停止が必要なエラーを返す。状態を失う自動再接続はせず、systemd等で中継全体を再起動する。
 
-非同期呼び出しはタイムアウトで中断されることがある。`publish`と`acknowledge`は、呼び出し元に成功が返らなくても処理が完了している可能性を考慮し、再試行を安全に扱う。`receive`は中断されても未処理データを消さない。
+プラグインは利用者が信頼した実行ファイルとして動き、サンドボックスではない。保持期間、永続性、再送の重複除去範囲は各実装が文書化する。
 
-## 新しいプラグインは3か所へ追加する
+## 新しいプラグインを追加する
 
-1. `plugins/<名前>`にRustクレートを作り、`stegrdb-relay`に依存させる。`RelayPlugin`と`Relay`を実装する。
-2. ルートの`Cargo.toml`に依存を追加する。外部サービス用の依存が重ければ、PostgreSQL実装と同じようにCargo featureで切り替える。
-3. `src/plugins.rs`の`builtin_plugins()`で登録し、`stegrdb.toml`の`relay.plugin`を指定する。
+1. 独立したリポジトリで`RelayPlugin`と`Relay`を実装する。
+2. JSON Schemaを含む`PluginManifest`を定義し、`--stdio`でSDKの`serve`、`--describe`で定義のJSONを返す。
+3. releaseビルド後に`scripts/package-plugin.py <実行ファイル> <出力先>`で配布物を作る。
+4. `stegrdb plugin add --path <出力先>`で追加し、設定検証と通信試験を行う。
 
-プラグイン固有の設定は`[relay.options]`で受け取る。APIにはJSON互換の値として渡るため、各実装が自分の設定型へ変換する。DB接続情報などのシークレットは設定値そのものを持たず、環境変数名を指定する。
+本体のCargo.tomlやプラグイン登録コードを変更する必要はない。privateリポジトリからCLIで取得する場合は`STEGRDB_GITHUB_TOKEN`または`GH_TOKEN`を設定する。
 
-送受信の検証には`plugins/memory/tests/delivery.rs`が参考になる。自ノードの除外、channelの分離、未ACKデータの再取得、送信とACKの冪等性、多重接続の拒否を確認する。順序、保持期間、永続性は実装ごとに文書化する。
+## P2Pは相互認証したQUICで直接送る
+
+接続先ごとに信頼する証明書とnode_idを固定する。接続後も証明書がそのnode_idに対応するかを照合し、別channelのフレームを拒否する。ローカルの同一ユーザではchannel/node_idをファイルロックで占有する。別マシンへ同じ秘密鍵とIDを複製して動かすことは禁止する。
+
+各ノードが全接続先へ送るため、転送済みフレームを別ノードがさらに中継するmesh routingは行わない。受信キューは4096件・64MiBが既定の上限。ACK後の直近65536件を重複除去する。キューと重複情報はメモリにあり、プロセス再起動で失われる。
+
+Next.jsの接続情報交換サーバを指定すると、認証付きHTTPSでIP・ポート・証明書のfingerprintだけを登録・取得する。共有状態はRedisに置き、60秒の有効期限を15秒ごとに更新する。本体のパケットはQUICで直接送り、このサーバを通さない。交換サーバが停止しても、取得済みのアドレスで直接通信を続ける。
+
+この版は相互に到達できるUDPアドレスを前提にする。NATの自動hole punching・STUN/TURN・ブラウザのWebRTCクライアントは未実装。Vercelへ置くだけでNAT制限を解消するわけではない。
 
 ## PostgreSQLはノードごとの未処理キューを持つ
 

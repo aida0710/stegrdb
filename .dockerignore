@@ -6,3 +6,7 @@ artifacts
 *.log
 .vm-lab
 __pycache__
+
+plugins/postgres
+plugins/p2p
+**/.git

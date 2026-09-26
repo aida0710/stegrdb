@@ -8,6 +8,7 @@ StartLimitIntervalSec=0
 [Service]
 User=stegrdb
 ExecStart=/opt/stegrdb-lab/stegrdb --config /opt/stegrdb-lab/stegrdb.toml
+Environment=STEGRDB_PLUGIN_DIR=/opt/stegrdb-lab/plugins
 EnvironmentFile=/opt/stegrdb-lab/postgres.env
 AmbientCapabilities=CAP_NET_RAW
 CapabilityBoundingSet=CAP_NET_RAW

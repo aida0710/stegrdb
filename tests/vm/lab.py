@@ -14,8 +14,16 @@ import scenarios
 from settings import NODES, ROOT, SSH_PORTS, STATE
 
 
-def up():
-    subprocess.run(["cargo", "build", "--release", "--locked"], cwd=ROOT, check=True)
+def up(relay):
+    subprocess.run(["cargo", "build", "--release", "--bin", "stegrdb", "--locked"], cwd=ROOT, check=True)
+    for plugin in ("postgres", "p2p"):
+        subprocess.run(["cargo", "build", "--release", "--locked", "--manifest-path", f"plugins/{plugin}/Cargo.toml"], cwd=ROOT, check=True)
+        subprocess.run([sys.executable, "scripts/package-plugin.py", f"plugins/{plugin}/target/release/stegrdb-plugin-{plugin}", str(STATE / "packages" / plugin)], cwd=ROOT, check=True)
+    identities = STATE / "identities"
+    identities.mkdir(exist_ok=True)
+    for node in NODES:
+        if not (identities / node).exists():
+            subprocess.run([str(ROOT / "plugins/p2p/target/release/stegrdb-plugin-p2p"), "identity", "--output", str(identities / node)], check=True)
     password = images.prepare_credentials()
     image = images.prepare_image()
     # まずDBを持つ1台を起動し、その準備が済んでから3台へ広げる。
@@ -23,7 +31,8 @@ def up():
         images.seed_guest(node, image)
         qemu.start(node)
         qemu.wait_ready(node)
-        remote.deploy(node, password)
+        remote.deploy(node, password, relay)
+    (STATE / "relay-mode").write_text(relay)
     print("VMラボを起動しました。scripts/vm-lab testで通信を検証できます。", flush=True)
 
 
@@ -31,16 +40,18 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("action", choices=("up", "test", "status", "ssh", "down", "destroy"))
     parser.add_argument("node", nargs="?", choices=NODES)
+    parser.add_argument("--relay", choices=("postgres", "p2p"))
     options = parser.parse_args()
+    relay = options.relay or ((STATE / "relay-mode").read_text().strip() if (STATE / "relay-mode").exists() else "postgres")
     os.umask(0o077)
     STATE.mkdir(mode=0o700, parents=True, exist_ok=True)
     # up/down/testの同時実行でディスクやサービスを入れ替えない。
     with (STATE / "lab.lock").open("w") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         if options.action == "up":
-            up()
+            up(relay)
         elif options.action == "test":
-            scenarios.run_tests()
+            scenarios.run_tests(relay)
         elif options.action == "status":
             for node in NODES:
                 print(f"{node}: {'running' if qemu.is_running(node) else 'stopped'} (SSH 127.0.0.1:{SSH_PORTS[node]})")
@@ -59,7 +70,10 @@ def main():
                     directory = STATE / node
                     if directory.exists():
                         shutil.rmtree(directory)
-                for filename in ("id_ed25519", "id_ed25519.pub", "known_hosts", "postgres-password"):
+                for name in ("identities", "packages"):
+                    if (STATE / name).exists():
+                        shutil.rmtree(STATE / name)
+                for filename in ("id_ed25519", "id_ed25519.pub", "known_hosts", "postgres-password", "relay-mode"):
                     (STATE / filename).unlink(missing_ok=True)
 
 

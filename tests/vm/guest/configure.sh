@@ -2,25 +2,28 @@
 set -euo pipefail
 cd /opt/stegrdb-lab
 node=$1
+relay=${2:-postgres}
 case "$node" in a|b|c) ;; *) exit 1 ;; esac
 systemctl stop stegrdb.service 2>/dev/null || true
 if ! id stegrdb >/dev/null 2>&1; then useradd --system --shell /usr/sbin/nologin stegrdb; fi
 chmod 755 stegrdb
+chmod 644 stegrdb.toml
+chmod -R a+rX packages
 chmod 600 postgres.env
 printf '%s\n' "$node" > node
-cat > stegrdb.toml <<EOF
-node_id = "vm-$node"
-channel = "vm-lab"
-interface = "relay0"
-promiscuous = true
-[relay]
-plugin = "postgres"
-[firewall]
-policy = "blacklist"
-rules = []
-EOF
+install -d -o stegrdb -g stegrdb /opt/stegrdb-lab/plugins
+chown -R stegrdb:stegrdb identity
+chmod 700 identity
+chmod 600 identity/key.der
+for plugin in postgres p2p; do
+  if [[ -d plugins/$plugin ]]; then
+    runuser -u stegrdb -- ./stegrdb plugin --directory /opt/stegrdb-lab/plugins update "$plugin" --path "packages/$plugin"
+  else
+    runuser -u stegrdb -- ./stegrdb plugin --directory /opt/stegrdb-lab/plugins add --path "packages/$plugin"
+  fi
+done
 
-if [[ $node == a ]]; then
+if [[ $node == a && $relay == postgres ]]; then
   pg_conftool 16 main set listen_addresses '*'
   # QEMUのhost forwardingはゲストから10.0.2.2に見える。専用DB・専用ロールだけ許可する。
   rule='host stegrdb stegrdb 10.0.2.2/32 scram-sha-256'

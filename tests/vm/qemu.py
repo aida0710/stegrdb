@@ -10,7 +10,7 @@ import remote
 from settings import (
     BOOT_TIMEOUT_SECONDS, CPU_COUNT, DATABASE_PORT, MEMORY_MIB,
     POLL_INTERVAL_SECONDS, PROGRESS_INTERVAL_SECONDS, SHUTDOWN_TIMEOUT_SECONDS,
-    SSH_PORTS, SSH_TIMEOUT_SECONDS, STATE,
+    SSH_PORTS, SSH_TIMEOUT_SECONDS, STATE, P2P_PORTS, P2P_GUEST_PORT,
 )
 
 
@@ -48,6 +48,7 @@ def start(node):
     directory = STATE / node
     (directory / "qmp.sock").unlink(missing_ok=True)
     forward = f"user,id=control,hostfwd=tcp:127.0.0.1:{SSH_PORTS[node]}-:22"
+    forward += f",hostfwd=udp:127.0.0.1:{P2P_PORTS[node]}-:{P2P_GUEST_PORT}"
     if node == "a":
         forward += f",hostfwd=tcp:127.0.0.1:{DATABASE_PORT}-:5432"
     subprocess.run([

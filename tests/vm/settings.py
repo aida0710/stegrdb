@@ -8,6 +8,8 @@ CACHE = Path.home() / ".cache/stegrdb-vm"
 NODES = ("a", "b", "c")
 SSH_PORTS = {"a": 22221, "b": 22222, "c": 22223}
 DATABASE_PORT = 25432
+P2P_PORTS = {"a": 27441, "b": 27442, "c": 27443}
+P2P_GUEST_PORT = 7443
 IMAGE_NAME = "ubuntu-24.04-server-cloudimg-amd64.img"
 IMAGE_URL = "https://cloud-images.ubuntu.com/releases/noble/release-20260801"
 # 3台で合計6GiB。DBとOSの初期化を並行しても余裕を持たせる。

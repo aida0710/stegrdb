@@ -7,6 +7,7 @@ use stegrdb::{
     config::AppConfig,
     engine::{Engine, EngineSettings},
     network::LinuxSocket,
+    plugin_manager::{run_cli, PluginStore},
     plugins::builtin_plugins,
 };
 use tokio_util::sync::CancellationToken;
@@ -15,13 +16,20 @@ use tokio_util::sync::CancellationToken;
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     let arguments: Vec<_> = std::env::args().skip(1).collect();
+    if arguments.first().map(String::as_str) == Some("plugin") {
+        return run_cli(&arguments[1..]).await;
+    }
     let registry = builtin_plugins()?;
+    let store = PluginStore::from_environment()?;
     if arguments == ["--list-plugins"] {
         println!("{}", registry.names().join("\n"));
+        for package in store.list()? {
+            println!("{}", package.manifest.name);
+        }
         return Ok(());
     }
     if arguments == ["--help"] || arguments == ["-h"] {
-        println!("stegrdb [--config PATH] [--check-config]\nstegrdb --list-plugins");
+        println!("stegrdb [--config PATH] [--check-config]\nstegrdb --list-plugins\nstegrdb plugin --help");
         return Ok(());
     }
     let mut path = PathBuf::from("stegrdb.toml");
@@ -36,10 +44,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let config = AppConfig::load(&path)?;
     if !registry.names().contains(&config.relay.plugin.as_str()) {
-        return Err(format!("未登録のプラグイン: {}", config.relay.plugin).into());
+        store.resolved_options(&config.relay.plugin, &config.relay.options)?;
     }
     if check_only {
-        println!("設定ファイルの構文と共通設定は正常です（接続・デバイス・プラグイン固有設定は未検証）");
+        println!("共通設定と外部プラグインの設定は正常です（接続・デバイスは未検証）");
         return Ok(());
     }
     match dotenv::dotenv() {
@@ -48,7 +56,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Err(_) => return Err(".envを読み込めません（認証情報保護のため内容は表示しません）".into()),
     }
     let network = Arc::new(LinuxSocket::open(&config.interface, config.promiscuous)?);
-    let relay = registry.connect(&config.relay.plugin, config.context(), config.relay.options).await?;
+    let relay = if registry.names().contains(&config.relay.plugin.as_str()) {
+        registry.connect(&config.relay.plugin, config.context(), config.relay.options).await?
+    } else {
+        store.connect(&config.relay.plugin, config.context(), config.relay.options).await?
+    };
     let engine = Arc::new(Engine::new(
         relay,
         network,
